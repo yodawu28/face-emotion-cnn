@@ -63,13 +63,13 @@ face-emotion/
 
 2. **Create a virtual environment** (recommended):
    ```bash
-   python -m venv uv_venv
+   uv venv .uv_venv/ --python 3.12 
    source uv_venv/bin/activate  # On Windows: uv_venv\Scripts\activate
    ```
 
 3. **Install dependencies**:
    ```bash
-   pip install -r requirements.txt
+   uv pip install -r requirements.txt
    ```
 
    The key dependencies include:
