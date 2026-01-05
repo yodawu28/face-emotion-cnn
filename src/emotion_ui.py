@@ -159,6 +159,10 @@ def load_icons_as_badges(
         else:
             img = normalize_to_bgra(img)
 
+        if img is None:
+            icons[e] = None
+            continue
+
         badge = make_badge(img, badge_size=badge_size, pad=pad, bg_alpha=bg_alpha)
         icons[e] = badge
 
@@ -172,7 +176,9 @@ def draw_emotion_row_on_frame(
         anchor: str = "top-right",  # "bottom-left" | "bottom-right" | "top-left" | "top-right"
         margin: int = 12,
         gap: int = 8,
-        dim_opacity: float = 0.18,
+        dim_opacity: float = 0.25,  # increased from 0.18 for better visibility
+        highlight_color: tuple = (0, 255, 0),  # Green border for selected
+        highlight_thickness: int = 3,
 ) -> np.ndarray:
     H, W = frame_bgr.shape[:2]
     any_badge = next((b for b in badges.values() if b is not None), None)
@@ -203,8 +209,21 @@ def draw_emotion_row_on_frame(
         if b is None:
             x += size + gap
             continue
-        op = 1.0 if (selected == e) else dim_opacity
+        
+        is_selected = (selected is not None and selected.lower() == e.lower())
+        op = 1.0 if is_selected else dim_opacity
         overlay_bgra_on_bgr(frame_bgr, b, x, y, opacity=op)
+        
+        # Draw highlight border around selected icon
+        if is_selected:
+            cv2.rectangle(
+                frame_bgr,
+                (x - 2, y - 2),
+                (x + size + 2, y + size + 2),
+                highlight_color,
+                highlight_thickness
+            )
+        
         x += size + gap
 
     return frame_bgr
