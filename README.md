@@ -335,6 +335,8 @@ Access at `http://localhost:8501`
 
 The project includes a complete training pipeline in `notebooks/Emotion.ipynb` for Google Colab.
 
+> **Note**: This project initially used the [Face Expression Recognition Dataset](https://www.kaggle.com/datasets/jonathanoheix/face-expression-recognition-dataset) by Jonathan Oheix, but encountered accuracy issues with neutral/sad/angry emotions. We then retrained with [FER+ corrected labels](https://www.kaggle.com/datasets/ashishpatel26/fer2013) achieving 76.76% validation accuracy. See [Model Improvement Journey](#-model-improvement-journey) for the complete story.
+
 ### Quick Training Guide
 
 1. **Open in Google Colab**:
@@ -345,7 +347,7 @@ The project includes a complete training pipeline in `notebooks/Emotion.ipynb` f
 
 2. **Setup** (automated in notebook):
    - Mount Google Drive
-   - Download FER2013 dataset from Kaggle
+   - Download FER2013 dataset from Kaggle (original or FER+ version)
    - Copy data to local disk (3x faster I/O)
    - Install dependencies
 
@@ -680,12 +682,20 @@ This project demonstrates several key machine learning and software engineering 
 
 This section documents the systematic process of improving model accuracy from initial deployment to production-ready performance.
 
+### Initial Dataset Choice
+
+**Started with**: [Face Expression Recognition Dataset](https://www.kaggle.com/datasets/jonathanoheix/face-expression-recognition-dataset) by Jonathan Oheix
+- **Dataset**: Pre-processed FER2013 with train/test split
+- **Initial Training**: Achieved ~65-70% validation accuracy
+- **Deployment**: Model loaded successfully, inference working
+
 ### Problem Discovery
 
-During initial testing, the emotion model showed poor accuracy on neutral, sad, and angry emotions:
+During initial testing with the Jonathan Oheix dataset model, discovered poor accuracy on neutral, sad, and angry emotions:
 - **Symptom**: Neutral faces consistently detected as "sad" with 60-70% confidence
 - **Impact**: Low confidence gaps (0.02-0.20) between top-2 predictions
 - **User Experience**: Frequent emotion switching, low reliability
+- **Root Cause Hypothesis**: Underlying FER2013 dataset quality issues
 
 ### Systematic Debugging Approach
 
@@ -703,11 +713,6 @@ During initial testing, the emotion model showed poor accuracy on neutral, sad, 
 - **Pattern**: Low confidence gaps between competing emotions (0.05-0.15)
 - **Root Cause Identified**: FER2013 dataset has ~40% mislabeling in neutral/sad/angry classes
 
-**Documentation Created**:
-- [`debug_mode.md`](debug_mode.md) - Complete debugging instructions
-- [`fer_plus_guide.md`](fer_plus_guide.md) - FER+ retraining guide
-- [`IMPLEMENTATION_SUMMARY.md`](IMPLEMENTATION_SUMMARY.md) - Technical implementation details
-- [`test_debug.py`](test_debug.py) - Automated testing script
 
 ### Critical Bug Discovery
 
@@ -739,16 +744,22 @@ votes = [
 
 ### FER+ Dataset Retraining
 
+**Decision to Switch Datasets**:
+- Initial dataset (Jonathan Oheix) is based on FER2013 with known labeling issues
+- Research showed FER+ provides corrected labels via crowd-sourcing
+- Goal: Improve accuracy on problematic emotion classes (neutral/sad/angry)
+
 **Dataset Acquisition**:
 1. Downloaded `fer2013.csv` (301MB) - original images
-2. Downloaded `fer2013new.csv` - corrected labels from FER+ project
+2. Downloaded `fer2013new.csv` - corrected labels from [FER+ project](https://github.com/microsoft/FERPlus)
 3. Uploaded to Google Drive for Colab access
 
-**FER+ Advantages**:
+**FER+ Advantages over Original FER2013**:
 - **10+ annotators per image** (vs 1 in original FER2013)
 - **Majority vote labels** - more reliable ground truth
 - **Filtered ambiguous samples** - images with no clear consensus removed
 - **Fixes ~40% of mislabeled images** in neutral/sad/angry classes
+- **Same images, better labels** - direct comparison possible
 
 **Training Results** (Google Colab T4 GPU):
 ```
