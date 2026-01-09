@@ -18,9 +18,11 @@ class EmotionClassifier:
 
     def __init__(self, model_path: str, labels_path: Optional[str] = None, 
                  device: str = "cpu", 
-                 build_model: Optional[Callable[[], torch.nn.Module]] = None) -> None:
+                 build_model: Optional[Callable[[], torch.nn.Module]] = None,
+                 debug_save_faces: bool = False) -> None:
         self.device = torch.device(device)
         self.labels = load_labels(label_path=labels_path)
+        self.debug_save_faces = debug_save_faces
 
         p = Path(model_path)
         if not p.exists():
@@ -62,6 +64,7 @@ class EmotionClassifier:
         self.model.to(self.device)
 
     def predict_from_roi(self, roi_bgr: np.ndarray) -> EmotionPredict:
+        # First pass: get prediction (without debug save)
         x = preprocess_face_roi(roi_bgr).to(self.device)  # (1, C, H, W)
 
         print(x.shape, x.dtype, x.min().item(), x.max().item(), x.mean().item())
@@ -78,6 +81,12 @@ class EmotionClassifier:
             gap = float(probs[top3[0]] - probs[top3[1]])
             print("top3=", [(self.labels[i], float(probs[i])) for i in top3], "gap=", gap)
             print("PREDICT:", self.labels[idx], conf)
+            
+            # Debug: Save preprocessed face with prediction
+            if self.debug_save_faces:
+                preprocess_face_roi(roi_bgr, debug_save=True, 
+                                  prediction=self.labels[idx], 
+                                  confidence=conf)
         
         idx = np.argmax(probs)
         label = self.labels[idx] if idx < len(self.labels) else str(idx)

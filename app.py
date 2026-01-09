@@ -7,6 +7,7 @@ and a custom CNN for emotion classification.
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -30,24 +31,49 @@ from src.face_engine import FaceEngine, draw_overlays
 @dataclass
 class EmotionConfig:
     """Configuration for emotion detection and switching logic."""
-    model_path: str = "models/emotion_resnet_model_ts.pth"
+    model_path: str = "models/emotion_resnet_fer_model_ts.pth"  # FER+ trained model (76.76% val acc)
     device: str = "cpu"
-    ema_alpha: float = 0.25           # Much more smoothing
-    inference_interval: float = 0.33
-    min_confidence: float = 0.45      # Only accept confident predictions
-    use_gap_filter: bool = True
-    min_gap: float = 0.18             # Require clear winner
-    snap_confidence: float = 0.80     # Very high for instant snap
-    snap_gap: float = 0.55            # Very clear prediction needed
-    switch_streak_required: int = 6   # Need 6 consecutive frames
-    switch_min_gap: float = 0.25      # High bar for considering switch
+    
+    # Multi-frame aggregation (NEW)
+    use_multi_frame: bool = True      # Enable temporal pooling
+    aggregate_window: float = 1.0     # Aggregate over 1 second
+    min_frames_required: int = 3      # Need at least 3 frames (first, middle, last)
+    aggregation_method: str = "mean"  # "mean", "max", or "voting"
+    use_first_middle_last: bool = True  # Sample only first, middle, last (not all frames)
+    use_recency_weighting: bool = True  # Weight recent predictions more heavily
+    adaptive_window: bool = True        # Use shorter window during transitions
+    transition_gap_threshold: float = 0.10  # Lower threshold to detect transitions
+    snap_on_strong_new: bool = True     # Snap immediately on very strong new emotion
+    strong_new_gap: float = 0.35        # Gap threshold for strong new emotion
+    
+    # Two-stage smoothing: Buffer → EMA (NEW)
+    use_buffer_ema: bool = True       # Apply EMA on top of buffer aggregation
+    buffer_ema_alpha: float = 0.5     # EMA alpha for aggregated output (0.5 = moderate smoothing)
+    
+    # EMA smoothing (used standalone when multi-frame disabled)
+    ema_alpha: float = 0.40           # Alpha for legacy EMA-only mode
+    inference_interval: float = 0.10  # Sample more frequently (10 FPS)
+    
+    # Thresholds (Tuned for FER+ model)
+    min_confidence: float = 0.30      # Accept predictions > 30% confidence
+    use_gap_filter: bool = False      # Disable gap filter - FER+ model has smaller gaps
+    min_gap: float = 0.03             # Only 3% gap needed (rarely used)
+    
+    # Switching (reduced with multi-frame stability)
+    snap_confidence: float = 0.75     # High for instant snap
+    snap_gap: float = 0.45            # Clear prediction needed
+    switch_streak_required: int = 2   # Reduced to 2 for faster UI response
+    switch_min_gap: float = 0.08      # Lowered to allow easier switching (8% gap)
+    
+    # Debug visualization
+    debug_save_faces: bool = True    # Save preprocessed faces for inspection
 
 
 @dataclass
 class FaceConfig:
     """Configuration for face detection quality gates."""
     min_face_size: int = 120          # Lower to reduce skips (was 130)
-    min_detection_score: float = 0.65
+    min_detection_score: float = 0.75  # Increased for better face quality (was 0.65)
     bbox_ttl: float = 1.0
     crop_margin: float = 0.35
 
@@ -77,11 +103,179 @@ def get_face_engine() -> FaceEngine:
     return FaceEngine(
         model_name="buffalo_s",
         providers=["CPUExecutionProvider"],
-        det_size=(320, 320),  # Smaller det_size = faster detection
+        det_size=(320, 320),  # buffalo_l needs larger det_size for accuracy
         db_dir="db/embeddings",
         threshold=0.35,
         unknown_percent_cutoff=30.0,
     )
+
+
+# =============================================================================
+# Multi-Frame Prediction Buffer
+# =============================================================================
+
+class PredictionBuffer:
+    """
+    Buffer to store recent predictions for temporal aggregation.
+    
+    Stores (timestamp, probs, confidence) tuples.
+    """
+    
+    def __init__(self, window_seconds: float = 1.0, max_size: int = 30):
+        self.window = window_seconds
+        self.max_size = max_size
+        self.buffer = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+    
+    def add(self, probs: np.ndarray, confidence: float):
+        """Add a new prediction to the buffer."""
+        with self.lock:
+            self.buffer.append((time.time(), probs.copy(), confidence))
+    
+    def get_recent(self, window: Optional[float] = None) -> List[tuple]:
+        """Get predictions within the time window."""
+        if window is None:
+            window = self.window
+        
+        cutoff = time.time() - window
+        
+        with self.lock:
+            return [(ts, p, c) for ts, p, c in self.buffer if ts >= cutoff]
+    
+    def get_first_middle_last(self, window: Optional[float] = None) -> List[tuple]:
+        """Get only first, middle, and last predictions from the window."""
+        recent = self.get_recent(window)
+        
+        if len(recent) < 3:
+            return recent
+        
+        # Sample first, middle, last
+        first = recent[0]
+        middle = recent[len(recent) // 2]
+        last = recent[-1]
+        
+        return [first, middle, last]
+    
+    def get_recent_weighted(self, window: Optional[float] = None, use_recent_half: bool = False) -> List[tuple]:
+        """
+        Get recent predictions, optionally focusing on most recent half.
+        
+        Args:
+            window: Time window in seconds
+            use_recent_half: If True, only return most recent 50% of predictions
+        """
+        recent = self.get_recent(window)
+        
+        if use_recent_half and len(recent) >= 4:
+            # Only use second half for faster adaptation
+            start_idx = len(recent) // 2
+            return recent[start_idx:]
+        
+        return recent
+    
+    def get_last_n(self, n: int = 2) -> List[tuple]:
+        """
+        Get only the last N predictions (ignoring time window).
+        Used for very fast transitions when new emotion is strong.
+        """
+        with self.lock:
+            if len(self.buffer) <= n:
+                return list(self.buffer)
+            return list(self.buffer)[-n:]
+    
+    def clear(self):
+        """Clear the buffer."""
+        with self.lock:
+            self.buffer.clear()
+    
+    @staticmethod
+    def aggregate_mean(predictions: List[tuple], use_recency_weighting: bool = False) -> tuple:
+        """
+        Aggregate predictions using weighted mean.
+        
+        Args:
+            predictions: List of (timestamp, probs, confidence) tuples
+            use_recency_weighting: Weight recent predictions more heavily
+        
+        Returns: (aggregated_probs, mean_confidence)
+        """
+        if not predictions:
+            return None, 0.0
+        
+        # Extract probs and confidences
+        all_probs = np.array([p for _, p, _ in predictions])
+        all_confs = np.array([c for _, _, c in predictions])
+        
+        if use_recency_weighting:
+            # Apply exponential decay: recent predictions get much more weight
+            # timestamps are already sorted (oldest to newest)
+            n = len(predictions)
+            # Create exponential weights: older=0.2, newer=1.0 (5x more weight to recent)
+            time_weights = np.linspace(0.2, 1.0, n) ** 2  # Square for more aggressive decay
+            
+            # Combine confidence and recency weights
+            weights = all_confs * time_weights
+            weights = weights / (weights.sum() + 1e-8)
+        else:
+            # Original: weight only by confidence
+            weights = all_confs / (all_confs.sum() + 1e-8)
+        
+        agg_probs = np.average(all_probs, axis=0, weights=weights)
+        mean_conf = float(np.mean(all_confs))
+        
+        return agg_probs, mean_conf
+    
+    @staticmethod
+    def aggregate_max(predictions: List[tuple]) -> tuple:
+        """
+        Aggregate by taking max probability for each class.
+        
+        Returns: (aggregated_probs, max_confidence)
+        """
+        if not predictions:
+            return None, 0.0
+        
+        all_probs = np.array([p for _, p, _ in predictions])
+        all_confs = np.array([c for _, _, c in predictions])
+        
+        # Max pooling across time
+        agg_probs = np.max(all_probs, axis=0)
+        max_conf = float(np.max(all_confs))
+        
+        return agg_probs, max_conf
+    
+    @staticmethod
+    def aggregate_voting(predictions: List[tuple]) -> tuple:
+        """
+        Aggregate by majority voting of top predictions.
+        
+        Returns: (aggregated_probs, vote_confidence)
+        """
+        if not predictions:
+            return None, 0.0
+        
+        # Get top prediction from each frame
+        votes = [int(np.argmax(p)) for _, p, _ in predictions]
+        all_probs = np.array([p for _, p, _ in predictions])
+        
+        # Count votes
+        vote_counts = np.bincount(votes, minlength=all_probs.shape[1])
+        winner = int(np.argmax(vote_counts))
+        vote_ratio = vote_counts[winner] / len(votes)
+        
+        # Create prob vector with winner having vote_ratio
+        agg_probs = np.zeros(all_probs.shape[1], dtype=np.float32)
+        agg_probs[winner] = vote_ratio
+        
+        # Distribute remaining prob to other classes proportionally
+        if vote_ratio < 1.0:
+            num_classes = all_probs.shape[1]
+            other_mask = np.arange(num_classes) != winner
+            other_probs = np.mean(all_probs[:, other_mask], axis=0)
+            other_probs = other_probs / (other_probs.sum() + 1e-8) * (1.0 - vote_ratio)
+            agg_probs[other_mask] = other_probs
+        
+        return agg_probs, float(vote_ratio)
 
 
 # =============================================================================
@@ -117,10 +311,20 @@ class VideoProcessor(VideoProcessorBase):
             model_path=self.emotion_cfg.model_path,
             labels_path=None,
             device=self.emotion_cfg.device,
+            debug_save_faces=self.emotion_cfg.debug_save_faces,
         )
 
-        # EMA smoother
+        # EMA smoother (optional, used when multi-frame is disabled)
         self.ema = EmotionEMA(n_classes=7, alpha=self.emotion_cfg.ema_alpha)
+        
+        # Multi-frame prediction buffer (NEW)
+        self.pred_buffer = PredictionBuffer(
+            window_seconds=self.emotion_cfg.aggregate_window,
+            max_size=30
+        )
+        
+        # EMA smoother for aggregated output (two-stage: Buffer → EMA)
+        self.agg_ema = EmotionEMA(n_classes=7, alpha=self.emotion_cfg.buffer_ema_alpha)
 
         # State: face detection
         self._last_bbox: Optional[tuple] = None
@@ -254,7 +458,12 @@ class VideoProcessor(VideoProcessorBase):
         det_score: float,
         now: float
     ) -> tuple:
-        """Predict emotion from face ROI with EMA smoothing."""
+        """
+        Predict emotion from face ROI with multi-frame temporal aggregation.
+        
+        NEW: Uses PredictionBuffer to aggregate predictions over time instead
+        of single-frame + EMA smoothing.
+        """
         cfg = self.emotion_cfg
 
         # Check if we should run emotion inference
@@ -289,31 +498,128 @@ class VideoProcessor(VideoProcessorBase):
         raw_label = self.emotion_model.labels[raw_idx]
         raw_gap = self._compute_top2_gap(raw_probs)
 
-        # Update EMA
-        self.ema.update(raw_probs.tolist())
-        self._maybe_snap_ema(raw_probs, raw_idx, raw_conf, raw_gap)
+        # Add to buffer
+        self.pred_buffer.add(raw_probs, raw_conf)
 
-        # Get smoothed prediction
-        ema_probs = np.asarray(self.ema.ema, dtype=np.float32).ravel()
-        ema_idx = int(np.argmax(ema_probs))
-        ema_conf = float(ema_probs[ema_idx])
-        ema_label = self.emotion_model.labels[ema_idx]
-        ema_gap = self._compute_top2_gap(ema_probs)
+        # Multi-frame aggregation (NEW)
+        if cfg.use_multi_frame:
+            # Detect transition: RAW shows different emotion from current with any gap
+            is_different = (self._last_emotion is not None and 
+                           raw_label != self._last_emotion)
+            
+            # Strong new emotion: RAW shows NEW emotion with high confidence gap
+            is_strong_new = is_different and raw_gap >= cfg.strong_new_gap
+            
+            # Normal transition: RAW differs with moderate confidence
+            in_transition = is_different and raw_gap >= cfg.transition_gap_threshold
+            
+            # Determine sampling strategy based on transition strength
+            if is_strong_new and cfg.snap_on_strong_new:
+                # Very strong new emotion - use only last 2 predictions for fast snap
+                recent = self.pred_buffer.get_last_n(2)
+                mode_label = "SNAP"
+            elif cfg.adaptive_window and in_transition:
+                # Normal transition - use shorter window and recent half
+                window = cfg.aggregate_window * 0.5
+                recent = self.pred_buffer.get_recent_weighted(window, use_recent_half=True)
+                mode_label = "TRANS"
+            elif cfg.use_first_middle_last:
+                # Steady state - use FML sampling
+                recent = self.pred_buffer.get_first_middle_last(cfg.aggregate_window)
+                mode_label = "FML"
+            else:
+                recent = self.pred_buffer.get_recent(cfg.aggregate_window)
+                mode_label = "ALL"
+            
+            # Need minimum frames (lower requirement during transitions)
+            min_required = 2 if (in_transition or is_strong_new) else cfg.min_frames_required
+            if len(recent) < min_required:
+                print(f"[EMO] Buffering... {len(recent)}/{min_required}")
+                return None, 0.0
+            
+            # Aggregate based on method
+            # Use aggressive recency weighting during transitions
+            use_recency = cfg.use_recency_weighting or in_transition
+            
+            if cfg.aggregation_method == "mean":
+                agg_probs, agg_conf = PredictionBuffer.aggregate_mean(
+                    recent, 
+                    use_recency_weighting=use_recency
+                )
+            elif cfg.aggregation_method == "max":
+                agg_probs, agg_conf = PredictionBuffer.aggregate_max(recent)
+            elif cfg.aggregation_method == "voting":
+                agg_probs, agg_conf = PredictionBuffer.aggregate_voting(recent)
+            else:
+                raise ValueError(f"Unknown aggregation method: {cfg.aggregation_method}")
+            
+            if agg_probs is None:
+                return None, 0.0
+            
+            # Stage 2: Apply EMA on aggregated output (NEW two-stage smoothing)
+            if cfg.use_buffer_ema:
+                # Snap EMA on strong transitions for faster response
+                if is_strong_new:
+                    self.agg_ema.ema = agg_probs.copy()  # Keep as numpy array
+                else:
+                    self.agg_ema.update(agg_probs.tolist())
+                
+                # Use EMA-smoothed aggregation
+                final_probs = np.asarray(self.agg_ema.ema, dtype=np.float32).ravel()
+            else:
+                # No EMA, use raw aggregation
+                final_probs = agg_probs
+            
+            # Get final prediction
+            final_idx = int(np.argmax(final_probs))
+            final_label = self.emotion_model.labels[final_idx]
+            final_conf = float(final_probs[final_idx])
+            final_gap = self._compute_top2_gap(final_probs)
+            
+            # Update timestamp
+            self._last_emotion_ts = now
+            
+            # Debug log
+            trans_marker = "*" if is_strong_new else ("~" if in_transition else "")
+            ema_tag = "+EMA" if cfg.use_buffer_ema else ""
+            print(
+                f"[EMO] RAW: {raw_label} {raw_conf:.3f} gap={raw_gap:.3f}{trans_marker} | "
+                f"AGG ({cfg.aggregation_method}-{mode_label}{ema_tag}, n={len(recent)}): {final_label} {final_conf:.3f} gap={final_gap:.3f} | "
+                f"det={det_score:.2f}"
+            )
+            
+            # Apply switching logic with final smoothed values
+            return self._apply_emotion_switching(
+                final_label, final_conf, final_gap,
+                raw_conf, raw_gap
+            )
+        
+        else:
+            # Legacy EMA smoothing path
+            self.ema.update(raw_probs.tolist())
+            self._maybe_snap_ema(raw_probs, raw_idx, raw_conf, raw_gap)
 
-        # Update timestamp
-        self._last_emotion_ts = now
+            # Get smoothed prediction
+            ema_probs = np.asarray(self.ema.ema, dtype=np.float32).ravel()
+            ema_idx = int(np.argmax(ema_probs))
+            ema_conf = float(ema_probs[ema_idx])
+            ema_label = self.emotion_model.labels[ema_idx]
+            ema_gap = self._compute_top2_gap(ema_probs)
 
-        # Debug log
-        print(
-            f"[EMO] RAW: {raw_label} {raw_conf:.3f} gap={raw_gap:.3f} | "
-            f"EMA: {ema_label} {ema_conf:.3f} | det={det_score:.2f}"
-        )
+            # Update timestamp
+            self._last_emotion_ts = now
 
-        # Apply switching logic
-        return self._apply_emotion_switching(
-            ema_label, ema_conf, ema_gap,
-            raw_conf, raw_gap
-        )
+            # Debug log
+            print(
+                f"[EMO] RAW: {raw_label} {raw_conf:.3f} gap={raw_gap:.3f} | "
+                f"EMA: {ema_label} {ema_conf:.3f} | det={det_score:.2f}"
+            )
+
+            # Apply switching logic
+            return self._apply_emotion_switching(
+                ema_label, ema_conf, ema_gap,
+                raw_conf, raw_gap
+            )
 
     def _apply_emotion_switching(
         self,
@@ -328,9 +634,12 @@ class VideoProcessor(VideoProcessorBase):
 
         # Check acceptance threshold
         if cand_conf < cfg.min_confidence:
+            print(f"[REJECT] Low confidence: {candidate} {cand_conf:.3f} < {cfg.min_confidence}")
             return None, 0.0
 
         if cfg.use_gap_filter and ema_gap < cfg.min_gap:
+            print(f"[REJECT] Low gap: {candidate} gap={ema_gap:.3f} < {cfg.min_gap}")
+            return None, 0.0
             return None, 0.0
 
         current = self._last_emotion

@@ -37,6 +37,9 @@ Pipfile
 # Others
 .pytype
 
+# Debug output
+debug_faces/
+
 
 ########################################################################
 # OSX - https://github.com/github/gitignore/blob/master/Global/macOS.gitignore
