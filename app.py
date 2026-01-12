@@ -336,6 +336,7 @@ class VideoProcessor(VideoProcessorBase):
         self._last_emotion: Optional[str] = None
         self._last_emotion_conf: float = 0.0
         self._last_emotion_ts: float = 0.0
+        self._last_emotion_probs: Optional[np.ndarray] = None  # Store all emotion probabilities
 
         # State: emotion switching
         self._switch_candidate: Optional[str] = None
@@ -348,6 +349,25 @@ class VideoProcessor(VideoProcessorBase):
         # State: UI badges
         self._badges: Optional[dict] = None
         self._badge_size: Optional[int] = None
+        
+        # State: emotion history for UI display
+        self._emotion_history: List[tuple] = []  # [(timestamp, emotion, confidence), ...]
+        self._max_history: int = 10
+
+    def get_emotion_data(self) -> dict:
+        """Get current emotion prediction data for UI display."""
+        with self.lock:
+            if self._last_emotion_probs is None:
+                return None
+            
+            return {
+                'emotion': self._last_emotion,
+                'confidence': self._last_emotion_conf,
+                'probabilities': dict(zip(self.emotion_model.labels, self._last_emotion_probs)),
+                'det_score': self._last_det_score,
+                'timestamp': self._last_emotion_ts,
+                'history': list(self._emotion_history),  # Include history
+            }
 
     # -------------------------------------------------------------------------
     # Public API
@@ -422,11 +442,23 @@ class VideoProcessor(VideoProcessorBase):
             with self.lock:
                 self._last_recognitions = recognitions
                 if emotion_label is not None:
+                    # Track emotion changes for history
                     if emotion_label != self._last_emotion:
                         print(
                             f"[STATE] Emotion: {self._last_emotion} → {emotion_label}")
+                        # Add to history when emotion changes
+                        self._emotion_history.append((now, emotion_label, emotion_conf))
+                        # Keep only last N entries
+                        if len(self._emotion_history) > self._max_history:
+                            self._emotion_history.pop(0)
+                    
                     self._last_emotion = emotion_label
                     self._last_emotion_conf = emotion_conf
+                    # Store the full probability distribution for UI display
+                    if hasattr(self, 'agg_ema') and self.agg_ema.ema is not None:
+                        self._last_emotion_probs = np.asarray(self.agg_ema.ema, dtype=np.float32).ravel()
+                    elif hasattr(self, 'ema') and self.ema.ema is not None:
+                        self._last_emotion_probs = np.asarray(self.ema.ema, dtype=np.float32).ravel()
 
         finally:
             self._infer_running = False
@@ -809,11 +841,11 @@ def _handle_enrollment(engine: FaceEngine, name: str, uploads) -> None:
 # Camera Stream
 # =============================================================================
 
-def render_camera() -> None:
+def render_camera():
     """Render the camera stream with WebRTC."""
-    st.subheader("📹 Camera")
+    st.markdown("### 📹 Camera")
 
-    webrtc_streamer(
+    webrtc_ctx = webrtc_streamer(
         key="face-emotion-cam",
         video_processor_factory=VideoProcessor,
         rtc_configuration={
@@ -821,14 +853,124 @@ def render_camera() -> None:
         },
         media_stream_constraints={
             "video": {
-                "width": {"min": 480, "ideal": 640, "max": 800},
-                "height": {"min": 360, "ideal": 480, "max": 600},
+                "width": {"min": 320, "ideal": 480, "max": 640},
+                "height": {"min": 240, "ideal": 360, "max": 480},
                 "frameRate": {"min": 15, "ideal": 24, "max": 30},
             },
             "audio": False,
         },
         async_processing=True,
     )
+    
+    return webrtc_ctx
+
+
+# =============================================================================
+# Emotion Info Panel
+# =============================================================================
+
+def render_emotion_info(webrtc_ctx) -> None:
+    """Render emotion prediction information panel."""
+    st.markdown("### 🎭 Emotion Analysis")
+    
+    # Emotion icon mapping
+    emotion_icons = {
+        'happy': '😊',
+        'sad': '😢',
+        'angry': '😠',
+        'fear': '😨',
+        'surprise': '😲',
+        'disgust': '🤢',
+        'neutral': '😐'
+    }
+    
+    # Auto-refresh every second to show live updates
+    placeholder = st.empty()
+    
+    if webrtc_ctx and webrtc_ctx.state.playing:
+        if webrtc_ctx.video_processor:
+            emotion_data = webrtc_ctx.video_processor.get_emotion_data()
+            
+            if emotion_data:
+                with placeholder.container():
+                    # Create two columns: main info + probabilities chart
+                    col1, col2 = st.columns([1, 2])
+                    
+                    with col1:
+                        # Main emotion card
+                        st.markdown("#### Current Emotion")
+                        emotion = emotion_data['emotion']
+                        confidence = emotion_data['confidence']
+                        
+                        icon = emotion_icons.get(emotion.lower(), '🎭')
+                        
+                        # Display emotion with large icon
+                        st.markdown(f"# {icon}")
+                        st.markdown(f"### {emotion.title()}")
+                        st.markdown(f"**{confidence:.1%}** confidence")
+                        
+                        # Additional metrics
+                        st.markdown("---")
+                        st.metric("Detection Score", f"{emotion_data['det_score']:.2%}")
+                        
+                        # Time since last update
+                        time_ago = time.time() - emotion_data['timestamp']
+                        if time_ago < 1:
+                            time_text = "Just now"
+                        else:
+                            time_text = f"{time_ago:.1f}s ago"
+                        st.caption(f"Last update: {time_text}")
+                    
+                    with col2:
+                        # Probability distribution
+                        st.markdown("#### Emotion Probabilities")
+                        
+                        probs = emotion_data['probabilities']
+                        
+                        # Sort by probability (descending)
+                        sorted_emotions = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+                        
+                        # Use Streamlit progress bars
+                        for emo, prob in sorted_emotions:
+                            emo_icon = emotion_icons.get(emo.lower(), '🎭')
+                            is_current = emo == emotion
+                            
+                            # Show label with icon
+                            label = f"{emo_icon} **{emo.title()}**" if is_current else f"{emo_icon} {emo.title()}"
+                            col_label, col_value = st.columns([3, 1])
+                            with col_label:
+                                st.markdown(label)
+                            with col_value:
+                                st.markdown(f"**{float(prob):.1%}**")
+                            
+                            # Progress bar - convert to native Python float
+                            st.progress(float(min(prob, 1.0)))
+                        
+                        # Add legend
+                        st.caption("🟢 High (≥60%) | 🟡 Medium (30-60%) | ⚪ Low (<30%)")
+                    
+                    # Emotion Change History
+                    history = emotion_data.get('history', [])
+                    if history:
+                        st.markdown("---")
+                        st.markdown("#### 📜 Emotion Change History")
+                        
+                        # Show history in reverse order (most recent first)
+                        for ts, emo, conf in reversed(history[-5:]):  # Show last 5
+                            time_str = time.strftime("%H:%M:%S", time.localtime(ts))
+                            emo_icon = emotion_icons.get(emo.lower(), '🎭')
+                            st.markdown(
+                                f"{emo_icon} **{emo.title()}** ({conf:.1%}) - 🕐 {time_str}"
+                            )
+            else:
+                with placeholder.container():
+                    st.info("👤 Waiting for face detection...")
+        else:
+            with placeholder.container():
+                st.info("👤 Video processor not ready...")
+    else:
+        with placeholder.container():
+            st.warning("📹 Start the camera to see emotion analysis")
 
 
 # =============================================================================
@@ -842,7 +984,29 @@ def main():
     engine = get_face_engine()
 
     render_sidebar(engine)
-    render_camera()
+    
+    # Create side-by-side layout for camera and analysis
+    cam_col, analysis_col = st.columns([1, 1])
+    
+    with cam_col:
+        # Render camera
+        webrtc_ctx = render_camera()
+    
+    with analysis_col:
+        # Render emotion info panel
+        render_emotion_info(webrtc_ctx)
+        
+        # Auto-refresh control
+        st.markdown("---")
+        auto_refresh = st.checkbox("🔄 Auto-refresh (every 1s)", value=True, key="auto_refresh")
+        
+        if st.button("🔄 Manual Refresh", key="refresh_btn"):
+            st.rerun()
+    
+    # Auto-refresh when camera is playing
+    if auto_refresh and webrtc_ctx and webrtc_ctx.state.playing:
+        time.sleep(1)
+        st.rerun()
 
 
 if __name__ == "__main__":

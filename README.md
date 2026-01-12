@@ -4,7 +4,17 @@ A production-ready real-time application combining **face recognition** and **em
 
 This project demonstrates end-to-end AI/ML development: from custom CNN training with advanced techniques (SE-ResNet, Focal Loss, OneCycleLR) to real-time inference with sophisticated smoothing algorithms for stable predictions.
 
-## 🎯 Project Overview
+## � Demo
+
+https://github.com/user-attachments/assets/video_demo_emotion.mp4
+
+https://github.com/user-attachments/assets/video_demo_emotion.mp4
+
+> **Demo Video**: Real-time face recognition and emotion detection in action. The system detects faces, recognizes enrolled users, and classifies emotions with live probability visualization and change history tracking.
+
+*If the video doesn't play above, you can find it in the [videos/video_demo_emotion.mp4](videos/video_demo_emotion.mp4) folder.*
+
+## �🎯 Project Overview
 
 This system performs two main tasks simultaneously:
 1. **Face Recognition**: Identify individuals using InsightFace embeddings
