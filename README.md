@@ -6,13 +6,11 @@ This project demonstrates end-to-end AI/ML development: from custom CNN training
 
 ## � Demo
 
-https://github.com/user-attachments/assets/video_demo_emotion.mp4
-
-https://github.com/user-attachments/assets/video_demo_emotion.mp4
+![Demo](videos/video_demo_emotion.gif)
 
 > **Demo Video**: Real-time face recognition and emotion detection in action. The system detects faces, recognizes enrolled users, and classifies emotions with live probability visualization and change history tracking.
 
-*If the video doesn't play above, you can find it in the [videos/video_demo_emotion.mp4](videos/video_demo_emotion.mp4) folder.*
+*Full quality video: [videos/video_demo_emotion.mp4](videos/video_demo_emotion.mp4)*
 
 ## �🎯 Project Overview
 
